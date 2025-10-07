@@ -1,11 +1,14 @@
 (function() {
   'use strict';
+  const VERSION = '0.2.1';
+  const DEBUG = false; // set true for limited console diagnostics
   
   // Enhanced target patterns with more specific matching
   const TARGET_PATTERNS = [
     '/bapi/c2c/',
     '/gateway-api/v1/private/c2c/',
-    '/sapi/v1/c2c/'
+    '/sapi/v1/c2c/',
+    '/c2c/'
   ];
 
   const RELEVANT_KEYWORDS = [
@@ -19,13 +22,10 @@
 
   function isTarget(url) {
     if (typeof url !== 'string') return false;
-    
-    // Kiểm tra pattern cơ bản
-    const hasPattern = TARGET_PATTERNS.some(p => url.includes(p));
+    const lower = url.toLowerCase();
+    const hasPattern = TARGET_PATTERNS.some(p => lower.includes(p));
     if (!hasPattern) return false;
-    
-    // Kiểm tra keywords để giảm noise
-    const hasKeyword = RELEVANT_KEYWORDS.some(k => url.includes(k));
+    const hasKeyword = RELEVANT_KEYWORDS.some(k => lower.includes(k));
     return hasKeyword;
   }
 
@@ -42,16 +42,20 @@
     return true;
   }
 
+  let diagCount = 0; // only used when DEBUG
   function emit(obj) {
     try {
       if (!shouldSend(obj.url)) return;
-      
-      console.log('[P2P Inject] Capturing:', obj.url);
-      window.postMessage({ 
+      if (DEBUG && diagCount < 10) {
+        diagCount++;
+        console.log('[P2P Inject] Capture', obj.method || obj.type, obj.url, 'status=', obj.status);
+      }
+      window.postMessage({
         __P2P_CAPTURE__: {
           ...obj,
-          userAgent: navigator.userAgent.slice(0, 50),
-          timestamp: new Date().toISOString()
+          userAgent: navigator.userAgent.slice(0, 80),
+          timestamp: new Date().toISOString(),
+          version: VERSION
         }
       }, '*');
     } catch (error) {
@@ -149,5 +153,7 @@
   
   window.XMLHttpRequest = PatchedXHR;
 
-  console.log('[P2P Inject] Enhanced hook installed - v0.2.1');
+  if (DEBUG) console.log('[P2P Inject] Hook installed -', VERSION);
+
+  // Optional passive logging (disabled in prod) could be re-added here if needed.
 })();

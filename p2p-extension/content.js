@@ -1,5 +1,8 @@
 (function() {
   'use strict';
+  // Lightweight production bridge (phase3 cleanup)
+  const BRIDGE_VERSION = '0.2.1';
+  const DEBUG = false; // flip to true for extra queue / send logs
   
   const WS_URL = 'ws://127.0.0.1:8123';
   const MAX_RECONNECT_ATTEMPTS = 10;
@@ -11,6 +14,7 @@
   let reconnectDelay = INITIAL_RECONNECT_DELAY;
   let isInjected = false;
   let messageQueue = [];
+  let wsConnecting = false; // Thêm flag để tránh spam connection
   const MAX_QUEUE_SIZE = 100;
 
   function injectScript() {
@@ -36,15 +40,22 @@
   }
 
   function connectWS() {
-    if (ws && ws.readyState === WebSocket.CONNECTING) {
-      return; // Already connecting
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return; // Already connected or connecting
     }
+    
+    if (wsConnecting) {
+      return; // Already in connecting process
+    }
+    
+    wsConnecting = true;
     
     try {
       ws = new WebSocket(WS_URL);
       
       ws.onopen = () => {
         console.log('[P2P Ext] WebSocket connected successfully');
+        wsConnecting = false;
         reconnectAttempts = 0;
         reconnectDelay = INITIAL_RECONNECT_DELAY;
         
@@ -57,15 +68,18 @@
       
       ws.onclose = (event) => {
         console.log(`[P2P Ext] WebSocket closed (code: ${event.code}, reason: ${event.reason})`);
+        wsConnecting = false;
         scheduleReconnect();
       };
       
       ws.onerror = (error) => {
         console.error('[P2P Ext] WebSocket error:', error);
+        wsConnecting = false;
       };
       
     } catch (error) {
       console.error('[P2P Ext] WebSocket connection failed:', error);
+      wsConnecting = false;
       scheduleReconnect();
     }
   }
@@ -88,23 +102,32 @@
   }
 
   function sendMessage(data) {
-    const message = JSON.stringify({
+    const payload = data.__P2P_CAPTURE__;
+    if (!payload) {
+      if (DEBUG) console.warn('[P2P Ext] Missing __P2P_CAPTURE__ on data');
+      return;
+    }
+    const messageObj = {
       kind: 'NET_CAPTURE',
-      payload: data.__P2P_CAPTURE__,
-      extension_version: '0.2.1',
-      url: window.location.href,
-      timestamp: Date.now()
-    });
-    
+      payload,
+      extension_version: BRIDGE_VERSION,
+      page_url: window.location.href,
+      ts_send: Date.now()
+    };
+    const message = JSON.stringify(messageObj);
+
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(message);
-    } else {
-      // Queue message if not connected
-      messageQueue.push(message);
-      if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift(); // Remove oldest message
+      try {
+        ws.send(message);
+        if (DEBUG) console.log('[P2P Ext] Sent ->', payload.url);
+      } catch (e) {
+        if (DEBUG) console.error('[P2P Ext] Send failed, queueing', e);
+        messageQueue.push(message);
       }
-      console.warn('[P2P Ext] WebSocket not ready, message queued');
+    } else {
+      messageQueue.push(message);
+      if (messageQueue.length > MAX_QUEUE_SIZE) messageQueue.shift();
+      if (DEBUG) console.debug('[P2P Ext] Queue size', messageQueue.length, 'waiting WS for', payload.url);
     }
   }
 
@@ -118,7 +141,7 @@
     
     try {
       sendMessage(data);
-      console.log('[P2P Ext] Message forwarded:', data.__P2P_CAPTURE__.url);
+      if (DEBUG) console.log('[P2P Ext] Message forwarded:', data.__P2P_CAPTURE__.url);
     } catch (error) {
       console.error('[P2P Ext] Failed to send message:', error);
     }
@@ -134,15 +157,11 @@
 
   // Initialize
   function initialize() {
-    console.log('[P2P Ext] Initializing P2P Assistant Bridge v0.2.1');
+    if (DEBUG) console.log('[P2P Ext] Initializing bridge', BRIDGE_VERSION, 'state=', document.readyState);
     injectScript();
     connectWS();
   }
 
-  // Start when DOM is ready
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initialize);
-  } else {
-    initialize();
-  }
+  // Run immediately (document_start) to avoid missing early requests
+  initialize();
 })();
