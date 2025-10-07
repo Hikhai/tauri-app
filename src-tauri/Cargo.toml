@@ -28,6 +28,7 @@ tokio-tungstenite = "0.21"
 tungstenite = "0.21"
 futures = "0.3"
 anyhow = "1"
+sha1 = "0.10"
 
 [features]
 # Đây là mặc định của template, giữ nguyên
