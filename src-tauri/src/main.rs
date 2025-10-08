@@ -1,138 +1,90 @@
 #![cfg_attr(all(not(debug_assertions), target_os="windows"), windows_subsystem="windows")]
-mod orders;
 
-use orders::store::OrderStore;
-use orders::parser_list::parse_order_list;
-use orders::parser_detail::parse_order_detail;
-use orders::dedup::Deduper;
+mod crypto;
+mod db;
+mod api { pub mod c2c_api_client; pub mod credentials; pub mod sync_engine; }
+mod orders { pub mod repo; }
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::State;
-use futures::StreamExt;
-use tokio::net::TcpListener;
-use tokio_tungstenite::accept_async;
-use serde::Deserialize;
-use serde_json::Value;
 use anyhow::Result;
 
-#[derive(Clone)]
-struct AppState {
-    store: Arc<OrderStore>
+use crypto::CryptoCtx;
+use db::Db;
+use api::credentials::CredentialsRepo;
+use api::c2c_api_client::C2CApiClient;
+use api::sync_engine::SyncEngine;
+use orders::repo::OrderRepo;
+
+// App context for Phase 4 (WS extension capture will be reintegrated with DB in Phase 6)
+struct AppCtx {
+    db: Arc<Db>,
+    order_repo: Arc<OrderRepo>,
+    creds_repo: Arc<CredentialsRepo>,
+    api_client: Mutex<Option<C2CApiClient>>,
 }
 
 #[tauri::command]
-async fn list_orders(state: State<'_, AppState>) -> Result<Vec<orders::store::OrderView>, String> {
-    Ok(state.store.list().await)
-}
-
-#[tauri::command]
-async fn set_my_nickname(state: State<'_, AppState>, nickname: String) -> Result<(), String> {
-    state.store.set_my_nickname(nickname).await;
+async fn store_api_credentials(state: State<'_, AppCtx>, label: String, api_key: String, api_secret: String) -> Result<(), String> {
+    state.creds_repo.store(&label, &api_key, &api_secret).await.map_err(|e| e.to_string())?;
+    {
+        let mut guard = state.api_client.lock().unwrap();
+        *guard = Some(C2CApiClient::new(api_key, api_secret));
+    }
     Ok(())
 }
 
-fn main() {
-    let store = Arc::new(OrderStore::default());
+#[tauri::command]
+async fn test_api_credentials(state: State<'_, AppCtx>) -> Result<String, String> {
+    let guard = state.api_client.lock().unwrap();
+    if guard.is_none() { return Err("Chưa có API credentials".into()); }
+    let client = guard.as_ref().unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let start = now - 5 * 60 * 1000;
+    let res = client.list_user_order_history("BUY", start, now, 1, 1).await.map_err(|e| e.to_string())?;
+    Ok(res.to_string())
+}
 
-    let ws_store = store.clone();
+#[tauri::command]
+async fn force_initial_sync(state: State<'_, AppCtx>, days: i64) -> Result<String, String> {
+    let (client, repo) = {
+        let guard = state.api_client.lock().unwrap();
+        if guard.is_none() { return Err("Chưa cấu hình API client".into()); }
+        (guard.as_ref().unwrap().clone(), state.order_repo.clone())
+    };
+    let engine = SyncEngine::new(&client, &repo);
+    engine.force_initial_sync(days).await.map_err(|e| e.to_string())?;
+    Ok("SYNC_OK".into())
+}
+
+#[tauri::command]
+async fn list_orders_from_db(state: State<'_, AppCtx>, limit: i64) -> Result<Vec<orders::repo::OrderRow>, String> {
+    state.order_repo.list_orders(limit).await.map_err(|e| e.to_string())
+}
+
+#[tokio::main]
+async fn main() {
+    let db = Arc::new(Db::init("p2p_app.db").await.expect("DB init failed"));
+    let crypto = CryptoCtx::new_dummy();
+    let creds_repo = Arc::new(CredentialsRepo::new(db.pool().clone(), crypto));
+    let order_repo = Arc::new(OrderRepo::new(db.pool().clone()));
+
+    let api_client = {
+        let mut opt = None;
+        if let Ok(Some((k,s))) = creds_repo.latest().await { opt = Some(C2CApiClient::new(k, s)); }
+        Mutex::new(opt)
+    };
+
+    let app_ctx = AppCtx { db, order_repo, creds_repo, api_client };
+
     tauri::Builder::default()
-        .setup(move |_app| {
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = ws_server("127.0.0.1:8123", ws_store).await {
-                    eprintln!("[WS] crashed: {e:?}");
-                }
-            });
-            Ok(())
-        })
-        .manage(AppState { store })
-        .invoke_handler(tauri::generate_handler![list_orders, set_my_nickname])
+        .manage(app_ctx)
+        .invoke_handler(tauri::generate_handler![
+            store_api_credentials,
+            test_api_credentials,
+            force_initial_sync,
+            list_orders_from_db
+        ])
         .run(tauri::generate_context!())
-        .expect("run failed");
-}
-
-#[derive(Deserialize)]
-struct NetWrapper {
-    kind: String,
-    payload: Value
-}
-
-async fn ws_server(addr: &str, store: Arc<OrderStore>) -> Result<()> {
-    println!("[WS] Listening {addr}");
-    let listener = TcpListener::bind(addr).await?;
-    let deduper = Arc::new(tokio::sync::Mutex::new(Deduper::new(1500, 500))); // 1.5s window
-
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        let store_peer = store.clone();
-        let dedup_peer = deduper.clone();
-        tokio::spawn(async move {
-            let ws_stream = match accept_async(stream).await {
-                Ok(s) => {
-                    println!("[WS] Client connected from {peer_addr}");
-                    s
-                },
-                Err(e) => { eprintln!("[WS] handshake error from {peer_addr}: {e}"); return; }
-            };
-            let (_w, mut r) = ws_stream.split();
-            while let Some(msg) = r.next().await {
-                match msg {
-                    Ok(m) if m.is_text() => {
-                        let raw = m.to_text().unwrap();
-                        if let Ok(wrapper) = serde_json::from_str::<NetWrapper>(raw) {
-                            if wrapper.kind != "NET_CAPTURE" { continue; }
-                            let req_url = wrapper.payload.get("url").and_then(|x| x.as_str()).unwrap_or("");
-                            let status = wrapper.payload.get("status").and_then(|x| x.as_i64()).unwrap_or(0);
-                            let ts = wrapper.payload.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
-                            // Lightweight trace (first 60 chars url)
-                            println!("[WS] Capture {} status={} ts={}", &req_url.chars().take(60).collect::<String>(), status, ts);
-
-                            let body = wrapper.payload.get("data").unwrap_or(&wrapper.payload);
-                            let body_len = body.to_string().len();
-                            let fp = orders::dedup::Deduper::make_fp(req_url, status, body_len);
-
-                            {
-                                let mut d = dedup_peer.lock().await;
-                                if !d.allow(&fp) && !req_url.contains("order-list") {
-                                    // println!("[WS] Dedup skip {}", req_url);
-                                    continue;
-                                }
-                            }
-
-                            if req_url.contains("order-list") {
-                                let list = parse_order_list(body);
-                                if !list.is_empty() {
-                                    let sample: Vec<String> = list.iter().take(3).map(|o| o.order_number.clone()).collect();
-                                    println!("[WS] Parsed order-list: {} orders sample={:?}", list.len(), sample);
-                                    store_peer.upsert_summaries(list, ts).await;
-                                }
-                            } else if req_url.contains("order-detail") || req_url.contains("getOrderDetail") {
-                                if let Some(detail) = parse_order_detail(body) {
-                                    println!("[WS] Parsed order-detail: {}", detail.order_number);
-                                    store_peer.upsert_detail(detail, ts).await;
-                                } else {
-                                    println!("[WS] order-detail parse failed");
-                                }
-                            } else if req_url.contains("get-order-status") {
-                                if let Some(code_val) = body.get("data")
-                                    .and_then(|d| d.get("orderStatus"))
-                                    .and_then(|x| x.as_i64()) {
-                                        println!("[WS] quick status code={}", code_val);
-                                }
-                            } else {
-                                // println!("[WS] Other url {}", req_url);
-                            }
-                        } else {
-                            eprintln!("[WS] JSON parse failed (ignored)");
-                        }
-                    }
-                    Ok(_) => {},
-                    Err(e) => {
-                        eprintln!("[WS] Read error: {e}");
-                        break;
-                    }
-                }
-            }
-            println!("[WS] Client disconnected {peer_addr}");
-        });
-    }
+        .expect("error while running tauri application");
 }
